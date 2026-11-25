@@ -1,0 +1,46 @@
+name: ALPHA XK Scanner
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL (e.g. http://testphp.vulnweb.com/)'
+        required: true
+        default: 'http://testphp.vulnweb.com/'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip nmap sqlmap nuclei
+          pip3 install requests beautifulsoup4
+
+      - name: Run Active Scan (Python)
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+        run: |
+          python3 scanner.py
+
+      - name: Run SQLMap (SQLi)
+        if: always()
+        run: |
+          sqlmap -u "${{ github.event.inputs.target_url }}" --batch --level=1 --risk=1 --output-dir=/tmp/sqlmap-output || true
+
+      - name: Run Nuclei (Vulnerability Templates)
+        if: always()
+        run: |
+          nuclei -u "${{ github.event.inputs.target_url }}" -o /tmp/nuclei-output.txt || true
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: scan-results
+          path: |
+            scan_report.json
+            /tmp/sqlmap-output
+            /tmp/nuclei-output.txt
