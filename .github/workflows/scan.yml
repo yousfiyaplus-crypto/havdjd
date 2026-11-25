@@ -14,11 +14,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install Tools
+      - name: Install Python Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip nmap sqlmap nuclei
-          pip3 install requests beautifulsoup4
+          python3 -m pip install --upgrade pip
+          pip3 install requests beautifulsoup4 urllib3
 
       - name: Run Active Scan (Python)
         env:
@@ -26,21 +25,8 @@ jobs:
         run: |
           python3 scanner.py
 
-      - name: Run SQLMap (SQLi)
-        if: always()
-        run: |
-          sqlmap -u "${{ github.event.inputs.target_url }}" --batch --level=1 --risk=1 --output-dir=/tmp/sqlmap-output || true
-
-      - name: Run Nuclei (Vulnerability Templates)
-        if: always()
-        run: |
-          nuclei -u "${{ github.event.inputs.target_url }}" -o /tmp/nuclei-output.txt || true
-
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: scan-results
-          path: |
-            scan_report.json
-            /tmp/sqlmap-output
-            /tmp/nuclei-output.txt
+          path: scan_report.json
