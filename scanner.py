@@ -1,96 +1,98 @@
 import os
 import json
-import requests
+import asyncio
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-import urllib3
 import re
 import concurrent.futures
-import traceback
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-TARGET_URL = os.environ.get('TARGET_URL', 'http://testphp.vulnweb.com/').rstrip('/')
+TARGET_URL = os.environ.get('TARGET_URL', 'https://unico.io').rstrip('/')
 findings = []
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-})
 
-print(f"[*] Starting scan on: {TARGET_URL}")
+async def fetch_page(url):
+    async with async_playwright() as p:
+        # تشغيل متصفح كروم بوضع التخفي
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        context = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        page = await context.new_page()
+        
+        print(f"[*] Navigating to {url}...")
+        try:
+            # الانتظار حتى تحميل الشبكة
+            await page.goto(url, wait_until='networkidle', timeout=30000)
+            html = await page.content()
+            print(f"[+] Page loaded successfully. Length: {len(html)}")
+            return html
+        except Exception as e:
+            print(f"[!] Navigation error: {e}")
+            return None
+        finally:
+            await browser.close()
 
-# 1. فحص الاتصال الأساسي
-try:
-    print(f"[*] Testing connection to {TARGET_URL}...")
-    res = session.get(TARGET_URL, timeout=15, verify=False)
-    print(f"[+] Connected! Status: {res.status_code}, Length: {len(res.text)}")
-    if res.status_code != 200:
-        findings.append({"severity": "info", "title": f"استجابة غير متوقعة ({res.status_code})", "evidence": TARGET_URL})
-except Exception as e:
-    print(f"[!] Connection failed: {e}")
-    findings.append({"severity": "crit", "title": "فشل الاتصال بالموقع", "evidence": str(e)})
-    # إذا فشل الاتصال الأساسي، نوقف الفحص ونحفظ التقرير
+def check_sensitive_paths(base_url):
+    print("[*] Checking sensitive paths...")
+    paths = ["admin/", "login", "phpinfo.php", "server-status", ".env", ".git/config"]
+    
+    # دالة مساعدة للفحص
+    def check_sync(path):
+        try:
+            import requests
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            res = requests.get(f"{base_url}/{path}", timeout=5, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
+            if res.status_code == 200 and "404" not in res.text[:200]:
+                return {"severity": "high", "title": f"مسار مفتوح: /{path}", "evidence": f"{base_url}/{path}"}
+        except:
+            pass
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(check_sync, paths))
+        return [r for r in results if r]
+
+async def main():
+    global findings
+    
+    # 1. جلب الصفحة بالمتصفح الوهمي
+    html = await fetch_page(TARGET_URL)
+    
+    if not html:
+        findings.append({"severity": "crit", "title": "فشل الاتصال بالموقع", "evidence": "Browser failed to load the page. Maybe it's completely down."})
+    else:
+        # 2. تحليل كود الصفحة
+        print("[*] Analyzing HTML...")
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # فحص ثغرات XSS في النماذج
+        forms = soup.find_all('form')
+        for form in forms:
+            for input_tag in form.find_all('input'):
+                input_name = input_tag.get('name')
+                if input_name and input_tag.get('type') in ['text', 'search']:
+                    findings.append({
+                        "severity": "info", 
+                        "title": "نموذج إدخال مكتشف", 
+                        "evidence": f"Input name: {input_name}"
+                    })
+        
+        # فحص التعليقات المسربة
+        comments = re.findall(r'<!--(.*?)-->', html, re.DOTALL)
+        for c in comments:
+            if re.search(r'(password|secret|api_key|db_pass)', c, re.IGNORECASE):
+                findings.append({"severity": "high", "title": "بيانات مسربة في تعليقات HTML", "evidence": c[:100]})
+        
+        # 3. فحص المسارات الحساسة (بالتوازي)
+        path_findings = check_sensitive_paths(TARGET_URL)
+        findings.extend(path_findings)
+
+    # حفظ التقرير
     with open('scan_report.json', 'w', encoding='utf-8') as f:
         json.dump({"target": TARGET_URL, "findings": findings}, f, ensure_ascii=False, indent=4)
-    exit(0)
-
-# 2. فحص المسارات الحساسة
-print("[*] Checking sensitive paths...")
-SENSITIVE_PATHS = ["admin/", "phpinfo.php", "server-status", ".env", ".git/config"]
-
-def check_path(path):
-    try:
-        url = f"{TARGET_URL}/{path}"
-        res = session.get(url, timeout=10, verify=False)
-        # نتحقق إن الصفحة مو صفحة 404
-        if res.status_code == 200 and "404" not in res.text and "not found" not in res.text.lower():
-            print(f"[+] Found path: /{path}")
-            return {"severity": "high", "title": f"مسار مفتوح: /{path}", "evidence": url}
-    except:
-        pass
-    return None
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-    results = list(executor.map(check_path, SENSITIVE_PATHS))
-    for r in results:
-        if r: findings.append(r)
-
-# 3. فحص ثغرات XSS
-print("[*] Testing forms for XSS...")
-try:
-    res = session.get(TARGET_URL, timeout=10, verify=False)
-    soup = BeautifulSoup(res.text, 'html.parser')
-    forms = soup.find_all('form')
-    print(f"[*] Found {len(forms)} forms.")
     
-    for form in forms:
-        action = form.get('action', '')
-        method = form.get('method', 'get').lower()
-        form_url = TARGET_URL + action if not action.startswith('http') else action
-        
-        for input_tag in form.find_all('input'):
-            input_name = input_tag.get('name')
-            if input_name and input_tag.get('type') in ['text', 'search', 'password']:
-                payload = '<script>alert("XSS")</script>'
-                print(f"[*] Testing input: {input_name}")
-                if method == 'post':
-                    req = session.post(form_url, data={input_name: payload}, timeout=10, verify=False)
-                else:
-                    req = session.get(form_url, params={input_name: payload}, timeout=10, verify=False)
-                
-                if payload in req.text:
-                    print(f"[!] XSS Found in {input_name}!")
-                    findings.append({
-                        "severity": "high", 
-                        "title": "ثغرة XSS منعكسة", 
-                        "evidence": f"Payload: {payload} in {input_name} at {form_url}"
-                    })
-except Exception as e:
-    print(f"[!] XSS Scan error: {e}")
-    traceback.print_exc()
+    print(f"[+] Scan complete. Found {len(findings)} issues.")
 
-# حفظ التقرير
-with open('scan_report.json', 'w', encoding='utf-8') as f:
-    json.dump({"target": TARGET_URL, "findings": findings}, f, ensure_ascii=False, indent=4)
-
-print(f"[+] Scan complete. Found {len(findings)} issues. Saved to scan_report.json")
+if __name__ == '__main__':
+    asyncio.run(main())
